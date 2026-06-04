@@ -1,0 +1,16 @@
+# Gradle
+.gradle/
+build/
+
+# IDEs
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+
+# Extracted sources
+burp/
+
+# Burp Suite
+*.burp
