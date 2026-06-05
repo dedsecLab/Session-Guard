@@ -6,14 +6,17 @@ import burp.api.montoya.MontoyaApi;
 /**
  * Session Guard — Burp Suite Extension
  *
- * Detects session expiry (HTTP 303 or configurable status codes) during scanning,
- * pauses all scanner/extension traffic, and alerts the user to update cookies/tokens.
+ * Detects session expiry (HTTP 303 or configurable status codes) during
+ * scanning,
+ * pauses all scanner/extension traffic, and alerts the user to update
+ * cookies/tokens.
  *
  * Architecture:
- *   SessionGuardExtension (entry point)
- *     ├── GateController         — thread-safe gate (CountDownLatch)
- *     ├── SessionGuardTab        — custom Burp tab (status, log, resume, config)
- *     └── SessionGuardHttpHandler — HttpHandler (detects expired sessions, gates requests)
+ * SessionGuardExtension (entry point)
+ * ├── GateController — thread-safe gate (CountDownLatch)
+ * ├── SessionGuardTab — custom Burp tab (status, log, resume, config)
+ * └── SessionGuardHttpHandler — HttpHandler (detects expired sessions, gates
+ * requests)
  */
 public class SessionGuardExtension implements BurpExtension {
 
@@ -27,7 +30,8 @@ public class SessionGuardExtension implements BurpExtension {
         // Custom tab UI — must be created before the handler so handler can log to it
         SessionGuardTab tab = new SessionGuardTab(api, gate);
 
-        // HTTP handler — monitors responses and blocks requests when session expires (Plug-and-play mode)
+        // HTTP handler — monitors responses and blocks requests when session expires
+        // (Plug-and-play mode)
         SessionGuardHttpHandler handler = new SessionGuardHttpHandler(api, gate, tab);
 
         // Session Handling Action — for 100% test case retention (Strict mode)
@@ -41,10 +45,11 @@ public class SessionGuardExtension implements BurpExtension {
         // Save settings when extension unloads or Burp closes
         api.extension().registerUnloadingHandler(tab::saveSettings);
 
-        api.logging().logToOutput("═══════════════════════════════════════════════");
+        api.logging().logToOutput("===================================================");
         api.logging().logToOutput("  Session Guard v1.0.0 loaded successfully");
+        api.logging().logToOutput("  Author: dedsecLab");
         api.logging().logToOutput("  Mode 1: Plug-and-play (HttpHandler active)");
         api.logging().logToOutput("  Mode 2: Strict Mode (Session Handling Action registered)");
-        api.logging().logToOutput("═══════════════════════════════════════════════");
+        api.logging().logToOutput("===================================================");
     }
 }
