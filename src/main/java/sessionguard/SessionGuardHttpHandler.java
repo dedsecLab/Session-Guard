@@ -7,6 +7,8 @@ import burp.api.montoya.http.handler.HttpRequestToBeSent;
 import burp.api.montoya.http.handler.HttpResponseReceived;
 import burp.api.montoya.http.handler.RequestToBeSentAction;
 import burp.api.montoya.http.handler.ResponseReceivedAction;
+import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.http.message.requests.HttpRequest;
 
 import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
@@ -63,6 +65,11 @@ public class SessionGuardHttpHandler implements HttpHandler {
 
     @Override
     public ResponseReceivedAction handleHttpResponseReceived(HttpResponseReceived response) {
+        // Skip validation probe responses to avoid recursive triggering
+        if (gate.isProbing()) {
+            return ResponseReceivedAction.continueWith(response);
+        }
+
         // If the user has disabled the built-in detection (e.g. for Strict Mode), ignore responses.
         if (!tab.isPluginDetectionEnabled()) {
             return ResponseReceivedAction.continueWith(response);
@@ -70,6 +77,14 @@ public class SessionGuardHttpHandler implements HttpHandler {
 
         // Only inspect responses from tools the user has enabled for monitoring
         if (!tab.isToolMonitored(response.toolSource().toolType())) {
+            return ResponseReceivedAction.continueWith(response);
+        }
+
+        // Ignore responses if the initiating request had no cookies (e.g. Unauthenticated / WCD checks).
+        // A request without cookies cannot have an "expired" session.
+        boolean hasCookie = response.initiatingRequest().headers().stream()
+                .anyMatch(h -> h.name().equalsIgnoreCase("Cookie"));
+        if (!hasCookie) {
             return ResponseReceivedAction.continueWith(response);
         }
 
@@ -121,7 +136,26 @@ public class SessionGuardHttpHandler implements HttpHandler {
                 return ResponseReceivedAction.continueWith(response);
             }
 
-            // No grace remaining — this is a real session expiry
+            // Validation probe — confirm the session is truly expired before pausing.
+            // This prevents false positives from scanner checks (e.g., Web Cache Deception)
+            // that strip cookies and produce trigger-code responses.
+            String validationUrl = tab.getValidationUrl();
+            if (!validationUrl.isEmpty()) {
+                boolean sessionStillValid = probeSessionValid(validationUrl, response);
+                if (sessionStillValid) {
+                    String fpUrl = response.initiatingRequest().url();
+                    String fpTs = LocalDateTime.now().format(TIMESTAMP_FMT);
+                    String fpMsg = String.format(
+                            "[%s]  ⏭ FALSE POSITIVE — HTTP %d ignored (validation probe confirmed session is alive)  ←  %s",
+                            fpTs, statusCode, fpUrl
+                    );
+                    tab.addLogEntry(fpMsg);
+                    api.logging().logToOutput("Session Guard: " + fpMsg);
+                    return ResponseReceivedAction.continueWith(response);
+                }
+            }
+
+            // No grace remaining and validation confirms expired — real session expiry
             String url = response.initiatingRequest().url();
             String timestamp = LocalDateTime.now().format(TIMESTAMP_FMT);
 
@@ -162,6 +196,73 @@ public class SessionGuardHttpHandler implements HttpHandler {
         }
 
         return ResponseReceivedAction.continueWith(response);
+    }
+
+    /**
+     * Probe the validation URL to confirm session expiry.
+     *
+     * @return true if the session is still valid (trigger was a false positive),
+     *         false if the session is expired (probe also triggered) or probe failed.
+     */
+    private boolean probeSessionValid(String validationUrl, HttpResponseReceived originalResponse) {
+        gate.setProbing(true);
+        try {
+            HttpRequest probeRequest = HttpRequest.httpRequestFromUrl(validationUrl);
+
+            // Copy cookies from the initiating request to the validation probe
+            String cookieValue = originalResponse.initiatingRequest().headerValue("Cookie");
+            if (cookieValue != null) {
+                probeRequest = probeRequest.withAddedHeader("Cookie", cookieValue);
+            }
+
+            api.logging().logToOutput("Session Guard: sending validation probe → " + validationUrl);
+            HttpRequestResponse probeResult = api.http().sendRequest(probeRequest);
+            int probeStatus = probeResult.response().statusCode();
+
+            // Check if probe response matches any trigger condition
+            Set<Integer> probeTriggerCodes = tab.getTriggerStatusCodes();
+            if (probeTriggerCodes.contains(probeStatus)) {
+                api.logging().logToOutput("Session Guard: probe confirmed EXPIRED (HTTP " + probeStatus + ")");
+                return false;
+            }
+
+            // Check header regex against probe response
+            String headerRegex = tab.getHeaderRegex();
+            if (!headerRegex.isEmpty()) {
+                try {
+                    Pattern p = Pattern.compile(headerRegex, Pattern.CASE_INSENSITIVE);
+                    StringBuilder headerStr = new StringBuilder();
+                    probeResult.response().headers().forEach(h ->
+                            headerStr.append(h.name()).append(": ").append(h.value()).append("\n"));
+                    if (p.matcher(headerStr.toString()).find()) {
+                        api.logging().logToOutput("Session Guard: probe confirmed EXPIRED (header regex match)");
+                        return false;
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            // Check body regex against probe response
+            String bodyRegex = tab.getBodyRegex();
+            if (!bodyRegex.isEmpty()) {
+                try {
+                    Pattern p = Pattern.compile(bodyRegex, Pattern.CASE_INSENSITIVE);
+                    if (p.matcher(probeResult.response().bodyToString()).find()) {
+                        api.logging().logToOutput("Session Guard: probe confirmed EXPIRED (body regex match)");
+                        return false;
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            // Probe returned a normal response — session is still alive
+            api.logging().logToOutput("Session Guard: probe shows session VALID (HTTP " + probeStatus + ") — false positive");
+            return true;
+
+        } catch (Exception e) {
+            api.logging().logToError("Session Guard: validation probe failed — " + e.getMessage());
+            return false; // fail-safe: assume session expired
+        } finally {
+            gate.setProbing(false);
+        }
     }
 
     /**

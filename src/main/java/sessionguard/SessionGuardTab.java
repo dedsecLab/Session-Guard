@@ -45,6 +45,7 @@ public class SessionGuardTab {
     private final JTextField statusCodesField;
     private final JTextField headerRegexField;
     private final JTextField bodyRegexField;
+    private final JTextField validationUrlField;
     private final JTextField graceCountField;
     private final JCheckBox popupCheckbox;
     private final JCheckBox soundCheckbox;
@@ -73,6 +74,7 @@ public class SessionGuardTab {
         this.statusCodesField = new JTextField("303", 20);
         this.headerRegexField = new JTextField("", 20);
         this.bodyRegexField = new JTextField("", 20);
+        this.validationUrlField = new JTextField("", 20);
         this.graceCountField = new JTextField("10", 5);
         this.popupCheckbox = new JCheckBox("Show popup notification", true);
         this.soundCheckbox = new JCheckBox("Play sound alert", true);
@@ -172,32 +174,45 @@ public class SessionGuardTab {
         bodyRegexField.setToolTipText("Regex to match within response body (leave empty to ignore)");
         triggerPanel.add(bodyRegexField, gbc);
 
-        // Row 3: Grace period
+        // Row 3: Validation URL
         gbc.gridx = 0; gbc.gridy = 3; gbc.gridwidth = 1;
         gbc.fill = GridBagConstraints.NONE; gbc.weightx = 0;
+        triggerPanel.add(new JLabel("Validation URL:"), gbc);
+        gbc.gridx = 1; gbc.gridy = 3; gbc.gridwidth = 3;
+        gbc.fill = GridBagConstraints.HORIZONTAL; gbc.weightx = 1.0;
+        validationUrlField.setToolTipText(
+                "URL to probe before pausing (e.g., https://target.com/dashboard). " +
+                "If this URL returns a normal (non-trigger) response, the trigger is ignored as a false positive. " +
+                "Prevents WCD and similar scanner checks from stopping the scan. Leave empty to disable."
+        );
+        triggerPanel.add(validationUrlField, gbc);
+
+        // Row 4: Grace period
+        gbc.gridx = 0; gbc.gridy = 4; gbc.gridwidth = 1;
+        gbc.fill = GridBagConstraints.NONE; gbc.weightx = 0;
         triggerPanel.add(new JLabel("Grace Period (requests):"), gbc);
-        gbc.gridx = 1; gbc.gridy = 3;
+        gbc.gridx = 1; gbc.gridy = 4;
         graceCountField.setToolTipText(
                 "After Resume, ignore this many trigger responses to drain the stale pipeline. " +
                 "Set this to your resource pool's concurrent request count (e.g., 10)."
         );
         triggerPanel.add(graceCountField, gbc);
-        gbc.gridx = 2; gbc.gridy = 3; gbc.gridwidth = 2;
+        gbc.gridx = 2; gbc.gridy = 4; gbc.gridwidth = 2;
         JLabel graceHint = new JLabel("(match your resource pool size — prevents false re-triggers)");
         graceHint.setFont(graceHint.getFont().deriveFont(Font.ITALIC, 11f));
         triggerPanel.add(graceHint, gbc);
 
-        // Row 4: Checkboxes
-        gbc.gridx = 0; gbc.gridy = 4; gbc.gridwidth = 1;
+        // Row 5: Checkboxes
+        gbc.gridx = 0; gbc.gridy = 5; gbc.gridwidth = 1;
         triggerPanel.add(popupCheckbox, gbc);
-        gbc.gridx = 1; gbc.gridy = 4;
+        gbc.gridx = 1; gbc.gridy = 5;
         triggerPanel.add(soundCheckbox, gbc);
 
-        // Row 5: Operating Mode
-        gbc.gridx = 0; gbc.gridy = 5; gbc.gridwidth = 1;
+        // Row 6: Operating Mode
+        gbc.gridx = 0; gbc.gridy = 6; gbc.gridwidth = 1;
         gbc.fill = GridBagConstraints.NONE; gbc.weightx = 0;
         triggerPanel.add(new JLabel("Operating Mode:"), gbc);
-        gbc.gridx = 1; gbc.gridy = 5; gbc.gridwidth = 3;
+        gbc.gridx = 1; gbc.gridy = 6; gbc.gridwidth = 3;
         gbc.fill = GridBagConstraints.HORIZONTAL; gbc.weightx = 1.0;
         modeSelector.setToolTipText("Select Mode 2 if you configured Burp Session Handling Rules for 100% test case retention.");
         triggerPanel.add(modeSelector, gbc);
@@ -321,6 +336,7 @@ public class SessionGuardTab {
         statusCodesField.addFocusListener(saveFocus);
         headerRegexField.addFocusListener(saveFocus);
         bodyRegexField.addFocusListener(saveFocus);
+        validationUrlField.addFocusListener(saveFocus);
         graceCountField.addFocusListener(saveFocus);
         for (JCheckBox cb : toolCheckboxes.values()) {
             cb.addActionListener(saveAction);
@@ -425,6 +441,13 @@ public class SessionGuardTab {
     }
 
     /**
+     * @return the validation URL text, empty string if not configured
+     */
+    public String getValidationUrl() {
+        return validationUrlField.getText().trim();
+    }
+
+    /**
      * @return true if the popup notification checkbox is checked
      */
     public boolean isPopupEnabled() {
@@ -453,6 +476,7 @@ public class SessionGuardTab {
         data.setString("SG_StatusCodes", statusCodesField.getText());
         data.setString("SG_HeaderRegex", headerRegexField.getText());
         data.setString("SG_BodyRegex", bodyRegexField.getText());
+        data.setString("SG_ValidationUrl", validationUrlField.getText());
         data.setString("SG_GraceCount", graceCountField.getText());
         data.setBoolean("SG_Popup", popupCheckbox.isSelected());
         data.setBoolean("SG_Sound", soundCheckbox.isSelected());
@@ -479,6 +503,9 @@ public class SessionGuardTab {
 
         String bodyRegex = data.getString("SG_BodyRegex");
         if (bodyRegex != null) bodyRegexField.setText(bodyRegex);
+
+        String validationUrl = data.getString("SG_ValidationUrl");
+        if (validationUrl != null) validationUrlField.setText(validationUrl);
 
         String graceCount = data.getString("SG_GraceCount");
         if (graceCount != null) graceCountField.setText(graceCount);

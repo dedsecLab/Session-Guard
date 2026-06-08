@@ -25,6 +25,16 @@ public class GateController {
     private final AtomicInteger blockedCount = new AtomicInteger(0);
     private final AtomicInteger graceRemaining = new AtomicInteger(0);
 
+    // Shared flag: suppresses HttpHandler trigger-checks while a validation probe is in-flight
+    private final java.util.concurrent.atomic.AtomicBoolean probing =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** Mark that a validation probe is in-flight (both Handler and Action use this). */
+    public void setProbing(boolean value) { probing.set(value); }
+
+    /** @return true if a validation probe is currently in-flight */
+    public boolean isProbing() { return probing.get(); }
+
     /**
      * Activates the gate. All subsequent calls to awaitIfPaused() will block
      * until resume() is called.

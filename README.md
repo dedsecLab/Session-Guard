@@ -93,6 +93,21 @@ If you have a resource pool of $N$ concurrent requests, $N-1$ requests might sti
 * **Sound Alert**: Emits a system beep when a pause is triggered.
 * **Burp Event Log**: Logs session pause and resume events to the Burp Suite system alert logs.
 
+### 5. Validation Probe (False Positive Prevention)
+Some Burp Scanner checks — notably **Web Cache Deception (WCD)** — intentionally strip the `Cookie` header from requests. The server responds with a redirect (e.g., `303`) because there is no session. Without protection, Session Guard would interpret this as a real session expiry and pause the scanner.
+
+The **Validation Probe** prevents this by double-checking before pausing:
+
+1. Set the **Validation URL** to any authenticated endpoint on your target (e.g., `https://target.com/dashboard`).
+2. When a trigger response is detected, Session Guard sends a quick probe request to the Validation URL **with your real cookies**.
+3. If the probe returns a **normal (non-trigger) response** → the session is still alive → the original trigger was a **false positive** (e.g., WCD) → it is silently ignored and scanning continues.
+4. If the probe **also triggers** (e.g., also returns `303`) → the session is truly expired → scanning is paused as usual.
+5. If the Validation URL is **left empty**, this feature is disabled and Session Guard behaves as before (immediate pause on any trigger).
+
+> **Tip**: The Validation URL should be a lightweight, fast-loading authenticated page. The probe adds one extra HTTP request per trigger detection, so pick something that responds quickly.
+
+This feature works in **both Mode 1 (Plug-and-play) and Mode 2 (Strict Mode)**.
+
 ---
 
 ## Building
@@ -133,6 +148,7 @@ The output JAR is compiled at: `build/libs/session-guard-1.0.0.jar`.
 | **Trigger Status Codes** | Input field for your target codes (e.g., `303, 401, 403`) | `303` |
 | **Header Match Regex** | Optional regex pattern to match against response headers (e.g., `Location:.*login\.php`) | `(empty)` |
 | **Body Match Regex** | Optional regex pattern to match against response body (e.g., `Your session has expired`) | `(empty)` |
+| **Validation URL** | URL to probe before pausing. If the probe gets a normal response, the trigger is ignored as a false positive (e.g., WCD). Leave empty to disable. | `(empty)` |
 | **Grace Period (requests)** | Number of trigger responses to ignore upon clicking Resume | `10` |
 | **Tool Monitoring Checkboxes** | Select tools (Scanner, Extensions, Intruder, Repeater, Proxy) | `Scanner`, `Extensions` (ON) |
 | **Show popup notification** | Enable modal popups on trigger | Checked |
@@ -146,7 +162,8 @@ The output JAR is compiled at: `build/libs/session-guard-1.0.0.jar`.
 ## Architecture Overview
 
 * **`SessionGuardExtension`**: The entry point implementing `BurpExtension` to register HTTP handlers and the UI tab.
-* **`GateController`**: Thread-safe manager using a `CountDownLatch` state gate. Intercepted threads call `await()` to block without spinning the CPU, waking up synchronously upon `resume()`.
-* **`SessionGuardHttpHandler`**: Implements Montoya's `HttpHandler`. It inspects responses for trigger codes on monitored tools to block requests on the gate when active.
-* **`SessionGuardTab`**: A custom GUI panel built using Swing to provide live control and detection logs.
+* **`GateController`**: Thread-safe manager using a `CountDownLatch` state gate. Intercepted threads call `await()` to block without spinning the CPU, waking up synchronously upon `resume()`. Also holds a shared `isProbing` flag used by the Validation Probe feature to prevent recursive trigger detection.
+* **`SessionGuardHttpHandler`**: Implements Montoya's `HttpHandler`. It inspects responses for trigger codes on monitored tools, runs a validation probe when configured, and blocks requests on the gate when active. (Mode 1)
+* **`SessionGuardAction`**: Implements Montoya's `SessionHandlingAction` for Strict Mode. Invoked by Burp's Session Handling Rules, it validates via probe before pausing and blocks threads until resume. (Mode 2)
+* **`SessionGuardTab`**: A custom GUI panel built using Swing to provide live control, configuration, and detection logs.
 
