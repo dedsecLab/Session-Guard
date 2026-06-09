@@ -12,27 +12,45 @@ Session Guard monitors HTTP traffic from your selected Burp Suite tools. When it
 
 1. **Blocks Future Traffic Instantly**: Future requests are intercepted and held in a thread-safe gate (using `CountDownLatch` to sleep threads efficiently with zero CPU spin).
 2. **Alerts You Immediately**: Triggers a popup alert dialog, plays an audible system beep, and writes a warning to the Burp Suite **Alerts** tab.
-3. **Grace Period Protection**: Allows you to define a grace period (e.g., ignoring the next 10 stale responses after you click Resume) to clear out the in-flight pipeline and prevent immediate false re-triggers.
-4. **Resumes Seamlessly**: Once you update your cookies/tokens in Burp's Cookie Jar or session headers, click **Resume Scanning** to release all queued requests.
-5. **Project Persistence**: All your configured settings and detection logs are automatically saved and loaded directly from your Burp Suite project file.
+3. **Resumes Seamlessly**: Once you update your cookies/tokens in Burp's Cookie Jar or session headers, click **Resume Scanning** to release all queued requests.
+4. **Project Persistence**: All your configured settings and detection logs are automatically saved and loaded directly from your Burp Suite project file.
 
 ---
 
 ## Operating Modes
 
-| Feature | Mode 1: Plug-and-play (Default) | Mode 2: Strict Mode (Experimental) |
+| Feature | Mode 1: Plug-and-play (Default) | Mode 2: Strict Mode |
 | :--- | :--- | :--- |
-| **Setup Required** | None (Just install and scan) | Manual (Burp Session Handling Rules) |
-| **Test Case Retention** | Loses a few in-flight test cases | **100% test cases retained** |
-| **Retry Logic** | Fails in-flight requests | Automatically re-issues failed requests |
+| **Setup Required** | None (Just install and scan) | Session Handling Rule in Burp |
+| **Test Case Retention** | Loses a few in-flight test cases | **~100% test cases retained** |
+| **Retry Logic** | Fails in-flight requests | Automatically re-issues held requests |
+| **Grace Period** | ✅ Needed (drains stale pipeline) | ❌ Not needed (requests blocked before sending) |
 | **Ideal For** | Quick scans, easy setup | Deep, comprehensive audits |
 
 ---
 
 ### Mode 1: Plug-and-play (Default)
 
-**Setup Instructions:**
+**Setup:** None — just install the extension and scan.
 
+**How it works:**
+
+```
+Scanner Request → goes to server → Response comes back
+                                         ↓
+                               ┌─ HTTP HANDLER ──────────────┐
+                               │ Response matches trigger?    │
+                               │   ↓ YES                      │
+                               │ Validation probe (if set)    │
+                               │   ↓ Confirmed expired        │
+                               │ PAUSE gate + notify user     │
+                               └──────────────────────────────┘
+                                         ↓
+                          All future requests BLOCKED
+                          until user clicks ▶ Resume
+```
+
+**Steps:**
 1. Configure your scan target and start an active scan.
 2. Session Guard runs silently in the background.
 3. **Cookie expires** → Extension triggers based on your configured status codes or regex patterns:
@@ -42,23 +60,115 @@ Session Guard monitors HTTP traffic from your selected Burp Suite tools. When it
 5. Switch to the **Session Guard** tab and click **▶ Resume**.
 6. All held requests resume with the updated credentials. *(Note: Requests that were already in-flight before the pause will return your configured trigger codes and be ignored via the Grace Period).*
 
-### Mode 2: Strict Mode (100% Test Case Retention) (Experimental)
+---
 
-**Setup Instructions:**
-In Plug-and-play mode, the requests that were already sent over the network when the session expired will fail, and those test cases will be lost (false negatives). To guarantee zero lost test cases, use **Strict Mode** by configuring Burp's native Session Handling Rules to invoke Session Guard and automatically retry failed requests:
+### Mode 2: Strict Mode (~100% Test Case Retention)
 
+Strict Mode uses Burp's native Session Handling Rules to block requests **before** they are sent. This means almost zero leaked requests with invalid cookies.
+
+**How it works:**
+
+```
+Scanner Request arrives at Session Handling Rule
+        ↓
+   ┌─ SESSION GUARD ACTION (pre-request) ────────────┐
+   │  • Gate already paused? → BLOCK immediately      │
+   │  • Cooldown active? → pass through (0 overhead)  │
+   │  • Cooldown expired? → probe validation URL      │
+   │    • Session valid → reset cooldown, pass through │
+   │    • Session expired → PAUSE gate, notify, BLOCK  │
+   └──────────────────────────────────────────────────┘
+        ↓ (request goes to server)
+   Response comes back
+        ↓
+   ┌─ HTTP HANDLER (post-response, backup) ───────────┐
+   │  • Response matches trigger (e.g. 303)?           │
+   │    • Validation probe → false positive? → ignore  │
+   │    • Real expiry → PAUSE gate immediately         │
+   └──────────────────────────────────────────────────┘
+        ↓
+   All subsequent requests BLOCKED at the Action gate
+   until user clicks ▶ Resume
+```
+
+Both the **Action** (pre-request check every ~30s) and the **HttpHandler** (post-response check) work together to catch session expiry as fast as possible.
+
+---
+
+#### Strict Mode Setup — Simple (Recommended)
+
+Just one rule action. No macros needed.
+
+**Step 1: Create Session Handling Rule**
 1. Go to **Settings** → **Sessions** → **Session Handling Rules**.
 2. Click **Add** to create a new rule.
-3. In **Rule Actions**, click **Add** → **Check session is valid**.
-4. Configure the "Check session is valid" dialog to match your session expiry signature (e.g., HTTP 303 or regex).
-5. Under "If session is invalid", select **Run a macro**.
-   - *(Note: Burp Suite's UI requires a macro here. If you don't have a login macro, simply create a "Dummy Macro" that makes a single fast request, such as a GET to the homepage).*
-6. Select your macro, and scroll to the bottom of the window.
-7. **CRITICAL**: Check the boxes for **Update current request with cookies from session handling cookie jar** and **If session is invalid, perform the action, update the request, and reissue it**.
-8. **CRITICAL**: Check the box for **After running the macro, invoke a Burp extension action handler** and select **Session Guard — Pause & Retry**.
-9. In the **Scope** tab, ensure the rule applies to **Scanner** (or your desired tools) and the correct target URLs.
+3. Give it a description (e.g., `Session Guard`).
 
-When this rule triggers, Session Guard will pause all threads hitting the rule. When you click **▶ Resume**, Burp will natively update the cookies and **re-issue all the failed test cases**!
+**Step 2: Add Rule Action**
+1. Under **Rule Actions**, click **Add** → **Invoke a Burp extension**.
+2. Select **Session Guard — Pause & Retry** from the dropdown.
+3. Click **OK**.
+
+**Step 3: Configure Scope**
+1. Switch to the **Scope** tab at the top of the rule editor.
+2. Under **Tools Scope**, select the tools you want to protect (e.g., **Scanner**, **Intruder**, **Repeater**).
+3. Under **URL Scope**, select **Use suite scope** or define your target URLs explicitly.
+4. Click **OK** to save.
+
+**Step 4: Configure the Extension**
+1. Go to the **Session Guard** tab in Burp.
+2. Set **Trigger Status Codes** (e.g., `303, 401`).
+3. Set **Validation URL** (e.g., `https://target.com/dashboard`).
+4. Change **Operating Mode** to **Mode 2: Strict Mode**.
+
+That's it! The extension will automatically probe the validation URL every ~30 seconds and pause instantly when the session expires.
+
+---
+
+#### Strict Mode Setup — Advanced (Zero Leaked Requests)
+
+For **absolute zero leaked requests**, use Burp's "Check session is valid" macro approach. This adds one extra HTTP request before every scanner request but guarantees no request ever goes out with an expired cookie.
+
+**Step 1: Record a Macro**
+1. Go to **Settings** → **Sessions** → **Macros** section.
+2. Click **Add**.
+3. Burp will open a recorder. Navigate to your validation URL (e.g., `https://target.com/dashboard`) so it captures the request.
+4. Select that single request and click **OK**.
+5. Give it a name (e.g., `Session Guard Validation`) → **OK**.
+
+**Step 2: Create Session Handling Rule**
+1. In **Settings** → **Sessions** → **Session Handling Rules**, click **Add**.
+2. Description: `Session Guard Strict Mode`.
+
+**Step 3: Add "Check session is valid" Action**
+1. Under **Rule Actions**, click **Add** → **Check session is valid**.
+2. Configure it:
+
+   - **Make request(s) to validate session:**
+     - Select **Run macro** → choose the macro you recorded in Step 1.
+
+   - **Inspect response to determine session validity:**
+     - Under **HTTP headers**, check for your trigger (e.g., status code `303`, or a `Location:` header containing a login redirect).
+     - Or under **Response body**, enter a regex that matches your login/error page.
+
+   - **Define behavior dependent on session validity:**
+     - Under **If session is invalid, perform the action below:**
+     - Select **Invoke a Burp extension handler** → **Session Guard — Pause & Retry**.
+
+3. Click **OK**.
+
+**Step 4: Configure Scope**
+1. Switch to the **Scope** tab.
+2. **Tools**: Select Scanner, Intruder, Repeater (whichever you need).
+3. **URL Scope**: Select **Use suite scope** or define explicitly.
+4. Click **OK**.
+
+**Step 5: Configure the Extension**
+1. Go to the **Session Guard** tab.
+2. Set **Trigger Status Codes** and **Validation URL**.
+3. Change **Operating Mode** to **Mode 2: Strict Mode**.
+
+With this setup, Burp checks the session BEFORE every request via the macro. If invalid, our extension is invoked, pauses the gate, and blocks all threads. **Zero requests leak through.**
 
 ---
 
@@ -75,15 +185,9 @@ In addition to status codes, you can detect session expiry by matching custom pa
 * **Body Match Regex**: Provide a regex pattern (e.g., `Your session has expired`) to match against the response body.
 * If either regex pattern matches, Session Guard will trigger immediately. All regex matches are evaluated case-insensitively.
 
-### 3. Tailored Tool Monitoring
-You can configure which Burp tools Session Guard monitors:
-* **Scanner**: Monitors Burp's built-in active and passive scanners.
-* **Extensions**: Monitors traffic sent by other extensions (such as *Active Scan++*, *Collaborator*, or custom scanner tools).
-* **Intruder**: Monitors intruder attack requests.
-* **Repeater**: Monitors repeater tab requests (disabled by default to prevent blocking manual tests).
-* **Proxy**: Monitors proxy browser traffic (disabled by default to prevent browser hangs).
+### 3. Grace Period (Stale Pipeline Drain) — Mode 1 Only
+> **Note**: Grace Period is only applicable in **Mode 1 (Plug-and-play)**. In Strict Mode (Mode 2), requests are blocked before they are sent, so there is no stale pipeline to drain.
 
-### 3. Grace Period (Stale Pipeline Drain)
 If you have a resource pool of $N$ concurrent requests, $N-1$ requests might still be sent or in-flight immediately after the session expires. When you update the session cookie and resume scanning, those stale requests will eventually return the trigger status code. 
 * To prevent Session Guard from instantly pausing again due to these stale responses, set the **Grace Period (requests)** to match your resource pool size (e.g., `10`). 
 * Upon clicking Resume, the extension will ignore the next $N$ trigger responses.
@@ -99,12 +203,11 @@ Some Burp Scanner checks — notably **Web Cache Deception (WCD)** — intention
 The **Validation Probe** prevents this by double-checking before pausing:
 
 1. Set the **Validation URL** to any authenticated endpoint on your target (e.g., `https://target.com/dashboard`).
-2. When a trigger response is detected, Session Guard sends a quick probe request to the Validation URL **with your real cookies**.
+2. When a trigger response is detected, Session Guard sends a quick probe request to the Validation URL **with your real cookies from the Cookie Jar**.
 3. If the probe returns a **normal (non-trigger) response** → the session is still alive → the original trigger was a **false positive** (e.g., WCD) → it is silently ignored and scanning continues.
 4. If the probe **also triggers** (e.g., also returns `303`) → the session is truly expired → scanning is paused as usual.
-5. If the Validation URL is **left empty**, this feature is disabled and Session Guard behaves as before (immediate pause on any trigger).
 
-> **Tip**: The Validation URL should be a lightweight, fast-loading authenticated page. The probe adds one extra HTTP request per trigger detection, so pick something that responds quickly.
+> **Tip**: The Validation URL should be a lightweight, fast-loading authenticated page. Pick something that responds quickly.
 
 This feature works in **both Mode 1 (Plug-and-play) and Mode 2 (Strict Mode)**.
 
@@ -145,25 +248,26 @@ The output JAR is compiled at: `build/libs/session-guard-1.0.0.jar`.
 | :--- | :--- | :--- |
 | **Status Indicator** | Displays `ACTIVE — Scanning normally` 🟢 or `PAUSED — Session Expired!` 🔴 | `ACTIVE` |
 | **Requests Blocked / Grace** | Shows the count of blocked requests when paused, or remaining grace tokens | `0` |
-| **Trigger Status Codes** | Input field for your target codes (e.g., `303, 401, 403`) | `303` |
+| **Trigger Status Codes** ⚹ | Input field for your target codes (e.g., `303, 401, 403`) | `303` |
 | **Header Match Regex** | Optional regex pattern to match against response headers (e.g., `Location:.*login\.php`) | `(empty)` |
 | **Body Match Regex** | Optional regex pattern to match against response body (e.g., `Your session has expired`) | `(empty)` |
-| **Validation URL** | URL to probe before pausing. If the probe gets a normal response, the trigger is ignored as a false positive (e.g., WCD). Leave empty to disable. | `(empty)` |
-| **Grace Period (requests)** | Number of trigger responses to ignore upon clicking Resume | `10` |
-| **Tool Monitoring Checkboxes** | Select tools (Scanner, Extensions, Intruder, Repeater, Proxy) | `Scanner`, `Extensions` (ON) |
+| **Validation URL** ⚹ | URL to probe before pausing. Prevents false positives from WCD and similar scanner checks. | `(empty)` |
+| **Grace Period (requests)** | Number of trigger responses to ignore upon clicking Resume (**Mode 1 only**) | `10` |
 | **Show popup notification** | Enable modal popups on trigger | Checked |
 | **Play sound alert** | Play an audible system beep on trigger | Checked |
+| **Operating Mode** | Mode 1 (Plug-and-play) or Mode 2 (Strict Mode) | Mode 1 |
 | **Resume Scanning Button** | Resumes traffic, applying the configured Grace Period | Enabled when paused |
 | **Pause Manually Button** | Manually pause scanning/traffic at any time | Enabled when active |
 | **Clear Log** | Clears the detection log window | — |
+
+> ⚹ = Required fields for proper extension operation
 
 ---
 
 ## Architecture Overview
 
-* **`SessionGuardExtension`**: The entry point implementing `BurpExtension` to register HTTP handlers and the UI tab.
-* **`GateController`**: Thread-safe manager using a `CountDownLatch` state gate. Intercepted threads call `await()` to block without spinning the CPU, waking up synchronously upon `resume()`. Also holds a shared `isProbing` flag used by the Validation Probe feature to prevent recursive trigger detection.
-* **`SessionGuardHttpHandler`**: Implements Montoya's `HttpHandler`. It inspects responses for trigger codes on monitored tools, runs a validation probe when configured, and blocks requests on the gate when active. (Mode 1)
-* **`SessionGuardAction`**: Implements Montoya's `SessionHandlingAction` for Strict Mode. Invoked by Burp's Session Handling Rules, it validates via probe before pausing and blocks threads until resume. (Mode 2)
-* **`SessionGuardTab`**: A custom GUI panel built using Swing to provide live control, configuration, and detection logs.
-
+* **`SessionGuardExtension`**: The entry point implementing `BurpExtension` to register HTTP handlers, session handling action, and the UI tab.
+* **`GateController`**: Thread-safe manager using a `CountDownLatch` state gate. Intercepted threads call `await()` to block without spinning the CPU, waking up synchronously upon `resume()`. Also holds a shared `isProbing` flag (with CAS-based `startProbing()`) used by the Validation Probe feature to prevent recursive trigger detection and ensure only one thread probes at a time.
+* **`SessionGuardHttpHandler`**: Implements Montoya's `HttpHandler`. It inspects responses for trigger codes, runs a validation probe when configured, and blocks requests on the gate when active. Works in both modes as a response-based detection layer.
+* **`SessionGuardAction`**: Implements Montoya's `SessionHandlingAction` for Strict Mode. Invoked by Burp's Session Handling Rules, it uses a smart cooldown-based validation probe (~1 probe every 30 seconds) and blocks threads until resume. Provides the pre-request blocking layer for Mode 2.
+* **`SessionGuardTab`**: A custom GUI panel built using Swing to provide live control, configuration, and detection logs. All settings are persisted to the Burp project file.

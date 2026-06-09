@@ -53,9 +53,6 @@ public class SessionGuardTab {
     private final JButton resumeButton;
     private final JButton pauseButton;
 
-    // Tool monitoring checkboxes
-    private final Map<ToolType, JCheckBox> toolCheckboxes = new EnumMap<>(ToolType.class);
-
     // Refresh timer for blocked count display
     private final Timer refreshTimer;
 
@@ -150,10 +147,17 @@ public class SessionGuardTab {
 
         // Row 0: Status codes
         gbc.gridx = 0; gbc.gridy = 0;
-        triggerPanel.add(new JLabel("Trigger Status Codes:"), gbc);
+        JLabel statusCodesLabel = new JLabel("Trigger Status Codes:");
+        JLabel statusCodesStar = new JLabel(" *");
+        statusCodesStar.setForeground(new Color(220, 40, 40));
+        statusCodesStar.setFont(statusCodesStar.getFont().deriveFont(Font.BOLD));
+        JPanel statusCodesLabelPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        statusCodesLabelPanel.add(statusCodesLabel);
+        statusCodesLabelPanel.add(statusCodesStar);
+        triggerPanel.add(statusCodesLabelPanel, gbc);
         gbc.gridx = 1; gbc.gridy = 0; gbc.gridwidth = 3;
         gbc.fill = GridBagConstraints.HORIZONTAL; gbc.weightx = 1.0;
-        statusCodesField.setToolTipText("Comma-separated status codes (e.g., 303, 401, 403)");
+        statusCodesField.setToolTipText("(Required) Comma-separated status codes (e.g., 303, 401, 403)");
         triggerPanel.add(statusCodesField, gbc);
 
         // Row 1: Header regex
@@ -177,28 +181,36 @@ public class SessionGuardTab {
         // Row 3: Validation URL
         gbc.gridx = 0; gbc.gridy = 3; gbc.gridwidth = 1;
         gbc.fill = GridBagConstraints.NONE; gbc.weightx = 0;
-        triggerPanel.add(new JLabel("Validation URL:"), gbc);
+        JLabel validationUrlLabel = new JLabel("Validation URL:");
+        JLabel validationUrlStar = new JLabel(" *");
+        validationUrlStar.setForeground(new Color(220, 40, 40));
+        validationUrlStar.setFont(validationUrlStar.getFont().deriveFont(Font.BOLD));
+        JPanel validationUrlLabelPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        validationUrlLabelPanel.add(validationUrlLabel);
+        validationUrlLabelPanel.add(validationUrlStar);
+        triggerPanel.add(validationUrlLabelPanel, gbc);
         gbc.gridx = 1; gbc.gridy = 3; gbc.gridwidth = 3;
         gbc.fill = GridBagConstraints.HORIZONTAL; gbc.weightx = 1.0;
         validationUrlField.setToolTipText(
-                "URL to probe before pausing (e.g., https://target.com/dashboard). " +
+                "(Required) URL to probe before pausing (e.g., https://target.com/dashboard). " +
                 "If this URL returns a normal (non-trigger) response, the trigger is ignored as a false positive. " +
-                "Prevents WCD and similar scanner checks from stopping the scan. Leave empty to disable."
+                "Prevents WCD and similar scanner checks from stopping the scan."
         );
         triggerPanel.add(validationUrlField, gbc);
 
-        // Row 4: Grace period
+        // Row 4: Grace period (Mode 1 only)
         gbc.gridx = 0; gbc.gridy = 4; gbc.gridwidth = 1;
         gbc.fill = GridBagConstraints.NONE; gbc.weightx = 0;
         triggerPanel.add(new JLabel("Grace Period (requests):"), gbc);
         gbc.gridx = 1; gbc.gridy = 4;
         graceCountField.setToolTipText(
-                "After Resume, ignore this many trigger responses to drain the stale pipeline. " +
-                "Set this to your resource pool's concurrent request count (e.g., 10)."
+                "(Mode 1 only) After Resume, ignore this many trigger responses to drain the stale pipeline. " +
+                "Set this to your resource pool's concurrent request count (e.g., 10). " +
+                "Not needed in Mode 2 (Strict) since requests are blocked before they are sent."
         );
         triggerPanel.add(graceCountField, gbc);
         gbc.gridx = 2; gbc.gridy = 4; gbc.gridwidth = 2;
-        JLabel graceHint = new JLabel("(match your resource pool size — prevents false re-triggers)");
+        JLabel graceHint = new JLabel("(Mode 1 only — match your resource pool size to prevent false re-triggers)");
         graceHint.setFont(graceHint.getFont().deriveFont(Font.ITALIC, 11f));
         triggerPanel.add(graceHint, gbc);
 
@@ -217,66 +229,15 @@ public class SessionGuardTab {
         modeSelector.setToolTipText("Select Mode 2 if you configured Burp Session Handling Rules for 100% test case retention.");
         triggerPanel.add(modeSelector, gbc);
 
+        // Row 7: Mandatory legend
+        gbc.gridx = 0; gbc.gridy = 7; gbc.gridwidth = 4;
+        gbc.fill = GridBagConstraints.NONE; gbc.weightx = 0;
+        JLabel legendLabel = new JLabel("* Required fields for proper extension operation");
+        legendLabel.setFont(legendLabel.getFont().deriveFont(Font.ITALIC, 11f));
+        legendLabel.setForeground(new Color(150, 150, 150));
+        triggerPanel.add(legendLabel, gbc);
+
         configWrapper.add(triggerPanel);
-        configWrapper.add(Box.createVerticalStrut(6));
-
-        // --- Tool Monitoring Section ---
-        JPanel toolPanel = new JPanel(new GridBagLayout());
-        toolPanel.setBorder(BorderFactory.createTitledBorder(
-                BorderFactory.createLineBorder(UIManager.getColor("Component.borderColor"), 1),
-                " Tool Monitoring ",
-                TitledBorder.LEFT, TitledBorder.TOP
-        ));
-        GridBagConstraints tgbc = new GridBagConstraints();
-        tgbc.insets = new Insets(4, 8, 4, 12);
-        tgbc.anchor = GridBagConstraints.WEST;
-
-        // Row 0: Info label
-        tgbc.gridx = 0; tgbc.gridy = 0; tgbc.gridwidth = 5;
-        JLabel toolInfoLabel = new JLabel("Select which Burp tools should be monitored and paused:");
-        toolInfoLabel.setFont(toolInfoLabel.getFont().deriveFont(Font.ITALIC, 11f));
-        toolPanel.add(toolInfoLabel, tgbc);
-
-        // Row 1: Tool checkboxes
-        tgbc.gridy = 1; tgbc.gridwidth = 1;
-
-        // Scanner — default ON
-        tgbc.gridx = 0;
-        JCheckBox scannerCb = new JCheckBox("Scanner", true);
-        scannerCb.setToolTipText("Monitor Burp's built-in active/passive scanner");
-        toolCheckboxes.put(ToolType.SCANNER, scannerCb);
-        toolPanel.add(scannerCb, tgbc);
-
-        // Extensions — default ON
-        tgbc.gridx = 1;
-        JCheckBox extensionsCb = new JCheckBox("Extensions", true);
-        extensionsCb.setToolTipText("Monitor extension traffic (Active Scan++, custom extensions, etc.)");
-        toolCheckboxes.put(ToolType.EXTENSIONS, extensionsCb);
-        toolPanel.add(extensionsCb, tgbc);
-
-        // Intruder — default OFF
-        tgbc.gridx = 2;
-        JCheckBox intruderCb = new JCheckBox("Intruder", false);
-        intruderCb.setToolTipText("Monitor Intruder attack traffic");
-        toolCheckboxes.put(ToolType.INTRUDER, intruderCb);
-        toolPanel.add(intruderCb, tgbc);
-
-        // Repeater — default OFF
-        tgbc.gridx = 3;
-        JCheckBox repeaterCb = new JCheckBox("Repeater", false);
-        repeaterCb.setToolTipText("Monitor Repeater requests");
-        toolCheckboxes.put(ToolType.REPEATER, repeaterCb);
-        toolPanel.add(repeaterCb, tgbc);
-
-        // Proxy — default OFF
-        tgbc.gridx = 4;
-        JCheckBox proxyCb = new JCheckBox("Proxy", false);
-        proxyCb.setToolTipText("Monitor Proxy traffic (may cause browser hangs if paused!)");
-        toolCheckboxes.put(ToolType.PROXY, proxyCb);
-        toolPanel.add(proxyCb, tgbc);
-
-        configWrapper.add(toolPanel);
-
         centerPanel.add(configWrapper, BorderLayout.NORTH);
 
         // — Detection Log —
@@ -338,9 +299,6 @@ public class SessionGuardTab {
         bodyRegexField.addFocusListener(saveFocus);
         validationUrlField.addFocusListener(saveFocus);
         graceCountField.addFocusListener(saveFocus);
-        for (JCheckBox cb : toolCheckboxes.values()) {
-            cb.addActionListener(saveAction);
-        }
 
         return panel;
     }
@@ -354,17 +312,6 @@ public class SessionGuardTab {
      */
     public JPanel getPanel() {
         return mainPanel;
-    }
-
-    /**
-     * Check if the given tool type is currently enabled for monitoring.
-     *
-     * @param toolType the Burp tool type to check
-     * @return true if the user has checked the corresponding checkbox
-     */
-    public boolean isToolMonitored(ToolType toolType) {
-        JCheckBox cb = toolCheckboxes.get(toolType);
-        return cb != null && cb.isSelected();
     }
 
     /**
@@ -482,10 +429,6 @@ public class SessionGuardTab {
         data.setBoolean("SG_Sound", soundCheckbox.isSelected());
         data.setInteger("SG_OperatingMode", modeSelector.getSelectedIndex());
         
-        for (Map.Entry<ToolType, JCheckBox> entry : toolCheckboxes.entrySet()) {
-            data.setBoolean("SG_Tool_" + entry.getKey().name(), entry.getValue().isSelected());
-        }
-        
         data.setString("SG_Log", logArea.getText());
     }
 
@@ -519,13 +462,6 @@ public class SessionGuardTab {
         Integer operatingMode = data.getInteger("SG_OperatingMode");
         if (operatingMode != null && operatingMode >= 0 && operatingMode < modeSelector.getItemCount()) {
             modeSelector.setSelectedIndex(operatingMode);
-        }
-        
-        for (Map.Entry<ToolType, JCheckBox> entry : toolCheckboxes.entrySet()) {
-            Boolean toolEnabled = data.getBoolean("SG_Tool_" + entry.getKey().name());
-            if (toolEnabled != null) {
-                entry.getValue().setSelected(toolEnabled);
-            }
         }
         
         String log = data.getString("SG_Log");

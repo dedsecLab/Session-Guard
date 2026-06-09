@@ -9,17 +9,32 @@ import burp.api.montoya.http.sessions.SessionHandlingActionData;
 
 import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
+import javax.swing.JTextArea;
+import javax.swing.JLabel;
+import javax.swing.JScrollPane;
 import java.awt.Toolkit;
+import java.awt.Dimension;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
- * Session Handling Action to provide 100% test case retention (Strict Mode).
- * When invoked by Burp's "Check session is valid" rule, this action pauses
- * the gate. Burp natively waits for this action to return before re-issuing
- * the modified request, guaranteeing zero test cases are lost.
+ * Session Handling Action for Strict Mode (100% test case retention).
+ *
+ * Simple setup: just add "Invoke extension: Session Guard — Pause & Retry"
+ * in your session handling rule. No macro needed.
+ *
+ * How it works:
+ *   - Uses a smart cooldown-based validation probe (~1 probe every 30 seconds)
+ *   - During cooldown: zero overhead, requests pass through instantly
+ *   - When cooldown expires: probes the validation URL with cookie jar cookies
+ *   - If session valid: resets cooldown, passes through
+ *   - If session expired: pauses gate, notifies user, blocks ALL threads
+ *   - After Resume: cooldown resets, immediately re-validates on next request
+ *
+ * Combined with HttpHandler response monitoring, this provides near-zero
+ * leaked requests with minimal overhead.
  */
 public class SessionGuardAction implements SessionHandlingAction {
 
@@ -29,6 +44,10 @@ public class SessionGuardAction implements SessionHandlingAction {
 
     private static final DateTimeFormatter TIMESTAMP_FMT =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    // Only send a validation probe every 30 seconds (near-zero overhead)
+    private static final long PROBE_COOLDOWN_MS = 30_000;
+    private volatile long lastSuccessfulProbeMs = 0;
 
     public SessionGuardAction(MontoyaApi api, GateController gate, SessionGuardTab tab) {
         this.api = api;
@@ -43,29 +62,79 @@ public class SessionGuardAction implements SessionHandlingAction {
 
     @Override
     public ActionResult performAction(SessionHandlingActionData actionData) {
-        String url = actionData.request().url();
-        String timestamp = LocalDateTime.now().format(TIMESTAMP_FMT);
-
-        // Validation probe — confirm the session is truly expired before pausing.
-        // This prevents false positives from scanner checks (e.g., Web Cache Deception)
-        // that strip cookies and produce trigger-code responses.
-        String validationUrl = tab.getValidationUrl();
-        if (!validationUrl.isEmpty()) {
-            boolean sessionStillValid = probeSessionValid(validationUrl, actionData);
-            if (sessionStillValid) {
-                String fpMsg = String.format(
-                        "[%s]  ⏭ FALSE POSITIVE (Strict) — ignored (validation probe confirmed session is alive)  ←  %s",
-                        timestamp, url
-                );
-                tab.addLogEntry(fpMsg);
-                api.logging().logToOutput("Session Guard: " + fpMsg);
-                // Return request unmodified — session is fine, let Burp proceed normally
-                return ActionResult.actionResult(actionData.request());
-            }
+        // 1. If a probe is already in-flight, pass through to avoid recursion
+        if (gate.isProbing()) {
+            return ActionResult.actionResult(actionData.request());
         }
 
-        // pause() returns true only for the first thread that triggers the pause
-        if (gate.pause()) {
+        // 2. If gate is already paused (by HttpHandler or previous probe), block immediately
+        if (gate.isPaused()) {
+            blockUntilResumed(actionData.request().url(), false);
+            return ActionResult.actionResult(actionData.request());
+        }
+
+        // 3. No validation URL → can't probe, rely on HttpHandler response detection
+        String validationUrl = tab.getValidationUrl();
+        if (validationUrl.isEmpty()) {
+            return ActionResult.actionResult(actionData.request());
+        }
+
+        // 4. Fast path: within cooldown → session was recently confirmed valid
+        long now = System.currentTimeMillis();
+        if (now - lastSuccessfulProbeMs < PROBE_COOLDOWN_MS) {
+            return ActionResult.actionResult(actionData.request());
+        }
+
+        // 5. Cooldown expired → try to acquire the probe lock (only 1 thread probes)
+        if (!gate.startProbing()) {
+            // Another thread is already probing — pass through
+            return ActionResult.actionResult(actionData.request());
+        }
+
+        boolean sessionExpired = false;
+        try {
+            // Double-check: gate might have been paused while waiting for CAS
+            if (gate.isPaused()) {
+                blockUntilResumed(actionData.request().url(), false);
+                return ActionResult.actionResult(actionData.request());
+            }
+
+            // Double-check cooldown (another thread may have probed while we waited)
+            long nowAfterCas = System.currentTimeMillis();
+            if (nowAfterCas - lastSuccessfulProbeMs < PROBE_COOLDOWN_MS) {
+                return ActionResult.actionResult(actionData.request());
+            }
+
+            // Send the validation probe
+            sessionExpired = !probeSessionValid(validationUrl);
+            if (!sessionExpired) {
+                // Session is alive — reset cooldown
+                lastSuccessfulProbeMs = System.currentTimeMillis();
+                return ActionResult.actionResult(actionData.request());
+            }
+        } finally {
+            gate.setProbing(false);
+        }
+
+        // 6. Session is EXPIRED — pause gate, notify, and block
+        // Reset cooldown so after Resume, the very next request re-validates immediately
+        lastSuccessfulProbeMs = 0;
+        blockUntilResumed(actionData.request().url(), true);
+        return ActionResult.actionResult(actionData.request());
+    }
+
+    /**
+     * Block the current thread until the user clicks Resume.
+     *
+     * @param url           the URL of the request being held
+     * @param firstDetector true if this thread is the one that detected the expiry
+     */
+    private void blockUntilResumed(String url, boolean firstDetector) {
+        String timestamp = LocalDateTime.now().format(TIMESTAMP_FMT);
+
+        if (firstDetector && gate.pause()) {
+            // — This thread detected the expiry AND won the pause race —
+
             // 1. Log to Session Guard tab
             String logMessage = String.format("[%s]  STRICT TRIGGER (Action)  ←  %s", timestamp, url);
             tab.addLogEntry(logMessage);
@@ -75,21 +144,34 @@ public class SessionGuardAction implements SessionHandlingAction {
             String alertMessage = String.format(
                     "SESSION EXPIRED (Strict Mode) — Trigger detected at %s. " +
                     "Scanner is PAUSED. Update your cookies/tokens, then click Resume in the Session Guard tab.",
-                    url
-            );
+                    url);
             api.logging().raiseCriticalEvent(alertMessage);
             api.logging().logToOutput("Session Guard: " + alertMessage);
 
-            // 3. Popup notification + beep (on Swing EDT)
+            // 3. Popup notification + beep
             if (tab.isPopupEnabled()) {
                 SwingUtilities.invokeLater(() -> {
                     Toolkit.getDefaultToolkit().beep();
+                    String messageText = buildPopupMessage(url);
+
+                    JTextArea textArea = new JTextArea(messageText);
+                    textArea.setEditable(false);
+                    textArea.setLineWrap(true);
+                    textArea.setWrapStyleWord(true);
+                    textArea.setFont(new JLabel().getFont());
+                    textArea.setOpaque(false);
+
+                    JScrollPane scrollPane = new JScrollPane(textArea);
+                    scrollPane.setBorder(null);
+                    scrollPane.setOpaque(false);
+                    scrollPane.getViewport().setOpaque(false);
+                    scrollPane.setPreferredSize(new Dimension(550, 250));
+
                     JOptionPane.showMessageDialog(
                             null,
-                            buildPopupMessage(url),
+                            scrollPane,
                             "Session Guard — Session Expired!",
-                            JOptionPane.WARNING_MESSAGE
-                    );
+                            JOptionPane.WARNING_MESSAGE);
                 });
             }
 
@@ -98,57 +180,32 @@ public class SessionGuardAction implements SessionHandlingAction {
                 Toolkit.getDefaultToolkit().beep();
             }
         } else {
-            // Already paused, just block this thread until resumed.
-            // Log silently so the user knows multiple threads were intercepted.
+            // Already paused — just log
             String logMessage = String.format("[%s]  STRICT HELD (Action)  ←  %s", timestamp, url);
             tab.addLogEntry(logMessage);
         }
 
-        // Block this thread. Burp will wait for us to return.
+        // Block this thread until the user clicks Resume
         try {
             gate.awaitIfPaused();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             api.logging().logToError("Session Guard: strict mode thread interrupted");
         }
-
-        // Return the request unmodified to Burp.
-        // Burp's native Session Handling Rule engine will handle updating the
-        // request with the new cookie from the Cookie Jar and re-issuing it!
-        return ActionResult.actionResult(actionData.request());
     }
 
     /**
-     * Build a human-readable popup message for the strict mode session-expiry alert.
-     */
-    private String buildPopupMessage(String url) {
-        return String.format(
-                "⚠  Session Expired (Strict Mode)!\n\n" +
-                "Burp Session Handling Rule intercepted a request to:\n%s\n\n" +
-                "All scanner threads hitting this rule have been PAUSED.\n\n" +
-                "To continue:\n" +
-                "  1. Update your cookies / tokens in Burp's Cookie Jar\n" +
-                "  2. Go to the \"Session Guard\" tab\n" +
-                "  3. Click  ▶ Resume  to release the held requests\n\n" +
-                "Burp will automatically re-issue the failed requests with updated cookies.",
-                url
-        );
-    }
-
-    /**
-     * Probe the validation URL to confirm session expiry.
+     * Probe the validation URL to check if the session is still valid.
      *
-     * @return true if the session is still valid (trigger was a false positive),
-     *         false if the session is expired (probe also triggered) or probe failed.
+     * @return true if session is still valid, false if expired
      */
-    private boolean probeSessionValid(String validationUrl, SessionHandlingActionData actionData) {
-        gate.setProbing(true);
+    private boolean probeSessionValid(String validationUrl) {
         try {
             HttpRequest probeRequest = HttpRequest.httpRequestFromUrl(validationUrl);
 
-            // Copy cookies from the original request to the validation probe
-            String cookieValue = actionData.request().headerValue("Cookie");
-            if (cookieValue != null) {
+            // Attach cookies from the Cookie Jar
+            String cookieValue = getCookieHeaderFromJar(validationUrl);
+            if (cookieValue != null && !cookieValue.isEmpty()) {
                 probeRequest = probeRequest.withAddedHeader("Cookie", cookieValue);
             }
 
@@ -169,8 +226,8 @@ public class SessionGuardAction implements SessionHandlingAction {
                 try {
                     Pattern p = Pattern.compile(headerRegex, Pattern.CASE_INSENSITIVE);
                     StringBuilder headerStr = new StringBuilder();
-                    probeResult.response().headers().forEach(h ->
-                            headerStr.append(h.name()).append(": ").append(h.value()).append("\n"));
+                    probeResult.response().headers()
+                            .forEach(h -> headerStr.append(h.name()).append(": ").append(h.value()).append("\n"));
                     if (p.matcher(headerStr.toString()).find()) {
                         api.logging().logToOutput("Session Guard: probe confirmed EXPIRED (header regex match)");
                         return false;
@@ -191,14 +248,69 @@ public class SessionGuardAction implements SessionHandlingAction {
             }
 
             // Probe returned a normal response — session is still alive
-            api.logging().logToOutput("Session Guard: probe shows session VALID (HTTP " + probeStatus + ") — false positive");
+            api.logging().logToOutput("Session Guard: probe shows session VALID (HTTP " + probeStatus + ")");
             return true;
 
         } catch (Exception e) {
             api.logging().logToError("Session Guard: validation probe failed (Strict) — " + e.getMessage());
             return false; // fail-safe: assume session expired
-        } finally {
-            gate.setProbing(false);
         }
+    }
+
+    /**
+     * Get cookies from Burp's Cookie Jar for the validation URL.
+     */
+    private String getCookieHeaderFromJar(String validationUrl) {
+        try {
+            java.net.URL url = new java.net.URL(validationUrl);
+            String host = url.getHost().toLowerCase();
+            String path = url.getPath();
+            if (path == null || path.isEmpty()) {
+                path = "/";
+            }
+
+            StringBuilder cookieHeader = new StringBuilder();
+            for (burp.api.montoya.http.message.Cookie cookie : api.http().cookieJar().cookies()) {
+                String domain = cookie.domain();
+                if (domain == null) continue;
+                domain = domain.toLowerCase();
+
+                // Domain matching
+                boolean domainMatch = false;
+                if (domain.startsWith(".")) {
+                    if (host.endsWith(domain.substring(1))) domainMatch = true;
+                } else {
+                    if (host.equals(domain) || host.endsWith("." + domain)) domainMatch = true;
+                }
+                if (!domainMatch) continue;
+
+                // Path matching
+                String cookiePath = cookie.path();
+                if (cookiePath != null && !path.startsWith(cookiePath)) continue;
+
+                if (cookieHeader.length() > 0) cookieHeader.append("; ");
+                cookieHeader.append(cookie.name()).append("=").append(cookie.value());
+            }
+            return cookieHeader.toString();
+        } catch (Exception e) {
+            api.logging().logToError("Session Guard: error matching cookies for URL - " + e.getMessage());
+            return "";
+        }
+    }
+
+    /**
+     * Build a human-readable popup message.
+     */
+    private String buildPopupMessage(String url) {
+        return String.format(
+                "⚠  Session Expired (Strict Mode)!\n\n" +
+                "Burp Session Handling Rule intercepted a request to:\n%s\n\n" +
+                "All scanner threads hitting this rule have been PAUSED.\n\n" +
+                "To continue:\n" +
+                "  1. Update your cookies / tokens in Burp's Cookie Jar\n" +
+                "  2. Go to the \"Session Guard\" tab\n" +
+                "  3. Click  ▶ Resume  to release the held requests\n\n" +
+                "Burp will automatically re-issue the failed requests with updated cookies.",
+                url);
     }
 }

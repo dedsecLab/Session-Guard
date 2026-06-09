@@ -32,6 +32,12 @@ public class GateController {
     /** Mark that a validation probe is in-flight (both Handler and Action use this). */
     public void setProbing(boolean value) { probing.set(value); }
 
+    /**
+     * Atomically try to acquire the probing lock. Only one thread can probe at a time.
+     * @return true if this thread won the lock, false if another thread is already probing
+     */
+    public boolean startProbing() { return probing.compareAndSet(false, true); }
+
     /** @return true if a validation probe is currently in-flight */
     public boolean isProbing() { return probing.get(); }
 

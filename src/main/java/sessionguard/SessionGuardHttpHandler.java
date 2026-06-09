@@ -12,7 +12,11 @@ import burp.api.montoya.http.message.requests.HttpRequest;
 
 import javax.swing.JOptionPane;
 import javax.swing.SwingUtilities;
+import javax.swing.JTextArea;
+import javax.swing.JLabel;
+import javax.swing.JScrollPane;
 import java.awt.Toolkit;
+import java.awt.Dimension;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Set;
@@ -22,17 +26,17 @@ import java.util.regex.Pattern;
  * Monitors HTTP responses for session-expiry status codes (e.g., 303).
  *
  * On detection:
- *   1. Closes the gate (blocks all future requests from monitored tools)
- *   2. Logs the event to the Session Guard tab
- *   3. Raises a critical Burp alert
- *   4. Shows a popup dialog + plays system beep
+ * 1. Closes the gate (blocks all future requests from monitored tools)
+ * 2. Logs the event to the Session Guard tab
+ * 3. Raises a critical Burp alert
+ * 4. Shows a popup dialog + plays system beep
  *
  * On every outgoing request (monitored tools only):
- *   - Calls gate.awaitIfPaused() which blocks if session is expired
+ * - Calls gate.awaitIfPaused() which blocks if session is expired
  *
  * Grace period:
- *   After resume, stale in-flight responses (from the resource pool) are
- *   silently ignored via gate.consumeGrace() to prevent false re-triggers.
+ * After resume, stale in-flight responses (from the resource pool) are
+ * silently ignored via gate.consumeGrace() to prevent false re-triggers.
  */
 public class SessionGuardHttpHandler implements HttpHandler {
 
@@ -40,8 +44,7 @@ public class SessionGuardHttpHandler implements HttpHandler {
     private final GateController gate;
     private final SessionGuardTab tab;
 
-    private static final DateTimeFormatter TIMESTAMP_FMT =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final DateTimeFormatter TIMESTAMP_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     public SessionGuardHttpHandler(MontoyaApi api, GateController gate, SessionGuardTab tab) {
         this.api = api;
@@ -51,14 +54,15 @@ public class SessionGuardHttpHandler implements HttpHandler {
 
     @Override
     public RequestToBeSentAction handleHttpRequestToBeSent(HttpRequestToBeSent request) {
-        // Only gate traffic from tools the user has enabled for monitoring
-        if (tab.isToolMonitored(request.toolSource().toolType())) {
-            try {
-                gate.awaitIfPaused();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                api.logging().logToError("Session Guard: request thread interrupted while paused");
-            }
+        if (gate.isProbing()) {
+            return RequestToBeSentAction.continueWith(request);
+        }
+
+        try {
+            gate.awaitIfPaused();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            api.logging().logToError("Session Guard: request thread interrupted while paused");
         }
         return RequestToBeSentAction.continueWith(request);
     }
@@ -70,17 +74,8 @@ public class SessionGuardHttpHandler implements HttpHandler {
             return ResponseReceivedAction.continueWith(response);
         }
 
-        // If the user has disabled the built-in detection (e.g. for Strict Mode), ignore responses.
-        if (!tab.isPluginDetectionEnabled()) {
-            return ResponseReceivedAction.continueWith(response);
-        }
-
-        // Only inspect responses from tools the user has enabled for monitoring
-        if (!tab.isToolMonitored(response.toolSource().toolType())) {
-            return ResponseReceivedAction.continueWith(response);
-        }
-
-        // Ignore responses if the initiating request had no cookies (e.g. Unauthenticated / WCD checks).
+        // Ignore responses if the initiating request had no cookies (e.g.
+        // Unauthenticated / WCD checks).
         // A request without cookies cannot have an "expired" session.
         boolean hasCookie = response.initiatingRequest().headers().stream()
                 .anyMatch(h -> h.name().equalsIgnoreCase("Cookie"));
@@ -92,7 +87,7 @@ public class SessionGuardHttpHandler implements HttpHandler {
         int statusCode = response.statusCode();
 
         boolean triggered = false;
-        
+
         // 1. Status Code Match
         if (triggerCodes.contains(statusCode)) {
             triggered = true;
@@ -108,7 +103,8 @@ public class SessionGuardHttpHandler implements HttpHandler {
                 if (p.matcher(headerStr.toString()).find()) {
                     triggered = true;
                 }
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+            }
         }
 
         // 3. Body Regex Match
@@ -119,7 +115,8 @@ public class SessionGuardHttpHandler implements HttpHandler {
                 if (p.matcher(response.bodyToString()).find()) {
                     triggered = true;
                 }
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+            }
         }
 
         if (triggered && !gate.isPaused()) {
@@ -129,8 +126,7 @@ public class SessionGuardHttpHandler implements HttpHandler {
                 String timestamp = LocalDateTime.now().format(TIMESTAMP_FMT);
                 String graceMsg = String.format(
                         "[%s]  ⏭ GRACE — HTTP %d ignored (stale pipeline, %d grace left)  ←  %s",
-                        timestamp, statusCode, gate.getGraceRemaining(), url
-                );
+                        timestamp, statusCode, gate.getGraceRemaining(), url);
                 tab.addLogEntry(graceMsg);
                 api.logging().logToOutput("Session Guard: " + graceMsg);
                 return ResponseReceivedAction.continueWith(response);
@@ -147,8 +143,7 @@ public class SessionGuardHttpHandler implements HttpHandler {
                     String fpTs = LocalDateTime.now().format(TIMESTAMP_FMT);
                     String fpMsg = String.format(
                             "[%s]  ⏭ FALSE POSITIVE — HTTP %d ignored (validation probe confirmed session is alive)  ←  %s",
-                            fpTs, statusCode, fpUrl
-                    );
+                            fpTs, statusCode, fpUrl);
                     tab.addLogEntry(fpMsg);
                     api.logging().logToOutput("Session Guard: " + fpMsg);
                     return ResponseReceivedAction.continueWith(response);
@@ -170,9 +165,8 @@ public class SessionGuardHttpHandler implements HttpHandler {
             // 3. Raise critical Burp alert (appears in Alerts tab)
             String alertMessage = String.format(
                     "SESSION EXPIRED — Trigger detected at %s (HTTP %d). " +
-                    "Scanner is PAUSED. Update your cookies/tokens, then click Resume in the Session Guard tab.",
-                    url, statusCode
-            );
+                            "Scanner is PAUSED. Update your cookies/tokens, then click Resume in the Session Guard tab.",
+                    url, statusCode);
             api.logging().raiseCriticalEvent(alertMessage);
             api.logging().logToOutput("Session Guard: " + alertMessage);
 
@@ -180,12 +174,26 @@ public class SessionGuardHttpHandler implements HttpHandler {
             if (tab.isPopupEnabled()) {
                 SwingUtilities.invokeLater(() -> {
                     Toolkit.getDefaultToolkit().beep();
+                    String messageText = buildPopupMessage(statusCode, url);
+
+                    JTextArea textArea = new JTextArea(messageText);
+                    textArea.setEditable(false);
+                    textArea.setLineWrap(true);
+                    textArea.setWrapStyleWord(true);
+                    textArea.setFont(new JLabel().getFont());
+                    textArea.setOpaque(false);
+
+                    JScrollPane scrollPane = new JScrollPane(textArea);
+                    scrollPane.setBorder(null);
+                    scrollPane.setOpaque(false);
+                    scrollPane.getViewport().setOpaque(false);
+                    scrollPane.setPreferredSize(new Dimension(550, 250));
+
                     JOptionPane.showMessageDialog(
                             null,
-                            buildPopupMessage(statusCode, url),
+                            scrollPane,
                             "Session Guard — Session Expired!",
-                            JOptionPane.WARNING_MESSAGE
-                    );
+                            JOptionPane.WARNING_MESSAGE);
                 });
             }
 
@@ -202,16 +210,17 @@ public class SessionGuardHttpHandler implements HttpHandler {
      * Probe the validation URL to confirm session expiry.
      *
      * @return true if the session is still valid (trigger was a false positive),
-     *         false if the session is expired (probe also triggered) or probe failed.
+     *         false if the session is expired (probe also triggered) or probe
+     *         failed.
      */
     private boolean probeSessionValid(String validationUrl, HttpResponseReceived originalResponse) {
         gate.setProbing(true);
         try {
             HttpRequest probeRequest = HttpRequest.httpRequestFromUrl(validationUrl);
 
-            // Copy cookies from the initiating request to the validation probe
-            String cookieValue = originalResponse.initiatingRequest().headerValue("Cookie");
-            if (cookieValue != null) {
+            // Get cookies from the cookie jar for the validation URL
+            String cookieValue = getCookieHeaderFromJar(validationUrl);
+            if (cookieValue != null && !cookieValue.isEmpty()) {
                 probeRequest = probeRequest.withAddedHeader("Cookie", cookieValue);
             }
 
@@ -232,13 +241,14 @@ public class SessionGuardHttpHandler implements HttpHandler {
                 try {
                     Pattern p = Pattern.compile(headerRegex, Pattern.CASE_INSENSITIVE);
                     StringBuilder headerStr = new StringBuilder();
-                    probeResult.response().headers().forEach(h ->
-                            headerStr.append(h.name()).append(": ").append(h.value()).append("\n"));
+                    probeResult.response().headers()
+                            .forEach(h -> headerStr.append(h.name()).append(": ").append(h.value()).append("\n"));
                     if (p.matcher(headerStr.toString()).find()) {
                         api.logging().logToOutput("Session Guard: probe confirmed EXPIRED (header regex match)");
                         return false;
                     }
-                } catch (Exception ignored) {}
+                } catch (Exception ignored) {
+                }
             }
 
             // Check body regex against probe response
@@ -250,11 +260,13 @@ public class SessionGuardHttpHandler implements HttpHandler {
                         api.logging().logToOutput("Session Guard: probe confirmed EXPIRED (body regex match)");
                         return false;
                     }
-                } catch (Exception ignored) {}
+                } catch (Exception ignored) {
+                }
             }
 
             // Probe returned a normal response — session is still alive
-            api.logging().logToOutput("Session Guard: probe shows session VALID (HTTP " + probeStatus + ") — false positive");
+            api.logging().logToOutput(
+                    "Session Guard: probe shows session VALID (HTTP " + probeStatus + ") — false positive");
             return true;
 
         } catch (Exception e) {
@@ -266,20 +278,77 @@ public class SessionGuardHttpHandler implements HttpHandler {
     }
 
     /**
+     * Get cookies from Burp's Cookie Jar that match the host and path of the
+     * validation URL.
+     */
+    private String getCookieHeaderFromJar(String validationUrl) {
+        try {
+            java.net.URL url = new java.net.URL(validationUrl);
+            String host = url.getHost().toLowerCase();
+            String path = url.getPath();
+            if (path == null || path.isEmpty()) {
+                path = "/";
+            }
+
+            StringBuilder cookieHeader = new StringBuilder();
+            for (burp.api.montoya.http.message.Cookie cookie : api.http().cookieJar().cookies()) {
+                String domain = cookie.domain();
+                if (domain == null) {
+                    continue;
+                }
+                domain = domain.toLowerCase();
+
+                // Domain matching
+                boolean domainMatch = false;
+                if (domain.startsWith(".")) {
+                    String domainWithoutDot = domain.substring(1);
+                    if (host.endsWith(domainWithoutDot)) {
+                        domainMatch = true;
+                    }
+                } else {
+                    if (host.equals(domain) || host.endsWith("." + domain)) {
+                        domainMatch = true;
+                    }
+                }
+
+                if (!domainMatch) {
+                    continue;
+                }
+
+                // Path matching
+                String cookiePath = cookie.path();
+                if (cookiePath != null) {
+                    if (!path.startsWith(cookiePath)) {
+                        continue;
+                    }
+                }
+
+                if (cookieHeader.length() > 0) {
+                    cookieHeader.append("; ");
+                }
+                cookieHeader.append(cookie.name()).append("=").append(cookie.value());
+            }
+            return cookieHeader.toString();
+        } catch (Exception e) {
+            api.logging().logToError("Session Guard: error matching cookies for URL - " + e.getMessage());
+            return "";
+        }
+    }
+
+    /**
      * Build a human-readable popup message for the session-expiry alert.
      */
     private String buildPopupMessage(int statusCode, String url) {
         return String.format(
                 "⚠  Session Expired!\n\n" +
-                "Trigger response detected at:\n%s\n(HTTP %d)\n\n" +
-                "All monitored tool requests have been PAUSED.\n\n" +
-                "To continue:\n" +
-                "  1. Update your cookies / tokens in Burp's Cookie Jar\n" +
-                "  2. Update any custom headers if needed\n" +
-                "  3. Go to the \"Session Guard\" tab\n" +
-                "  4. Click  ▶ Resume  to continue scanning\n\n" +
-                "Requests blocked so far: %d",
-                url, statusCode, gate.getBlockedCount()
-        );
+                        "Trigger response detected at:\n%s\n(HTTP %d)\n\n" +
+                        "All monitored tool requests have been PAUSED.\n\n" +
+                        "To continue:\n" +
+                        "  1. Update your cookies / tokens in Burp's Cookie Jar\n" +
+                        "  2. Update any custom headers if needed\n" +
+                        "  3. Go to the \"Session Guard\" tab\n" +
+                        "  4. Click  ▶ Resume  to continue scanning\n\n" +
+                        "Requests blocked so far: %d",
+                url, statusCode, gate.getBlockedCount());
     }
 }
